@@ -180,8 +180,13 @@ def method_status(workdir, method):
 
 def method_times(workdir, method, status):
     """Approximate (start_epoch, end_epoch) from file mtimes. start = earliest
-    observed file activity for the method; end = latest (the done-marker for
-    DONE, last log write for FAILED). RUNNING -> no end yet; PENDING -> neither.
+    run-produced file; end = latest (done-marker for DONE, last log write for
+    FAILED). RUNNING -> no end yet; PENDING -> neither.
+
+    IMPORTANT: only the job log and done-marker are used -- NOT activity_glob.
+    activity_glob can match bundled reference data (e.g. FreeSurfer's 2012
+    fsaverage_sym template) whose preserved mtimes would otherwise be reported
+    as the start time. Those globs are for the liveness check only.
     These are filesystem mtimes, not exact SLURM submit/start/end."""
     if status == "PENDING":
         return None, None
@@ -191,7 +196,6 @@ def method_times(workdir, method, status):
         patterns.append(pr["done_file"])
     if pr.get("done_glob"):
         patterns.append(pr["done_glob"])
-    patterns += pr.get("activity_glob", [])
     mtimes = []
     for pat in patterns:
         for p in glob.glob(os.path.join(workdir, pat)):
