@@ -178,6 +178,34 @@ def method_status(workdir, method):
     return "FAILED"
 
 
+def method_times(workdir, method, status):
+    """Approximate (start_epoch, end_epoch) from file mtimes. start = earliest
+    observed file activity for the method; end = latest (the done-marker for
+    DONE, last log write for FAILED). RUNNING -> no end yet; PENDING -> neither.
+    These are filesystem mtimes, not exact SLURM submit/start/end."""
+    if status == "PENDING":
+        return None, None
+    pr = METHOD_PROBES[method]
+    patterns = [pr["log"]]
+    if pr.get("done_file"):
+        patterns.append(pr["done_file"])
+    if pr.get("done_glob"):
+        patterns.append(pr["done_glob"])
+    patterns += pr.get("activity_glob", [])
+    mtimes = []
+    for pat in patterns:
+        for p in glob.glob(os.path.join(workdir, pat)):
+            try:
+                mtimes.append(os.path.getmtime(p))
+            except OSError:
+                pass
+    if not mtimes:
+        return None, None
+    start = min(mtimes)
+    end = max(mtimes) if status in ("DONE", "FAILED") else None
+    return start, end
+
+
 def _infer_job_id(d):
     return _ARCHIVE_SUFFIX.sub("", os.path.basename(d.rstrip("/")))
 
@@ -273,14 +301,22 @@ def scan():
         }
         for m in METHODS:
             row[m] = rec["statuses"].get(m, "--")  # -- = method not expected
+            if m in rec["statuses"]:
+                s, e = method_times(rec["workdir"], m, rec["statuses"][m])
+            else:
+                s, e = None, None
+            row[f"{m}_start"] = fmt(s) if s else ""
+            row[f"{m}_end"] = fmt(e) if e else ""
         rows.append(row)
         if rec["job_status"] in ("COMPLETE", "FAILED"):
             terminal.append(rec)
     return rows, terminal
 
 
-CSV_FIELDS = ["job_id", "mrn", "patient_name", "submitter", "submitted_at",
-              *METHODS, "job_status", "last_update"]
+CSV_FIELDS = ["job_id", "mrn", "patient_name", "submitter", "submitted_at"]
+for _m in METHODS:
+    CSV_FIELDS += [_m, f"{_m}_start", f"{_m}_end"]
+CSV_FIELDS += ["job_status", "last_update"]
 
 
 def write_csv(rows):
