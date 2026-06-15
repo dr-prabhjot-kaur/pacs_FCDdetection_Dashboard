@@ -30,6 +30,7 @@ import json
 import os
 import re
 import smtplib
+import subprocess
 import sys
 import time
 from email.message import EmailMessage
@@ -75,6 +76,27 @@ STALE_SECS = int(os.environ.get("FCD_STALE_SECS", str(6 * 3600)))
 
 META_NAME = "dashboard_meta.json"
 METHODS = ["meld_classifier", "meld_graph", "nnunet"]
+
+# SLURM job-name prefix per method (set by process_series.sh at dispatch):
+#   nnunet-<job_id>, meld-graph-<job_id>, meld-classifier-<job_id>
+SACCT_NAME_PREFIX = {
+    "nnunet": "nnunet",
+    "meld_graph": "meld-graph",
+    "meld_classifier": "meld-classifier",
+}
+# Set FCD_USE_SACCT=0 to disable and use file-based detection only.
+USE_SACCT = os.environ.get("FCD_USE_SACCT", "1") != "0"
+SACCT_BIN = os.environ.get("FCD_SACCT_BIN", "sacct")
+
+# Map SLURM States -> dashboard status. Anything not listed -> FAILED.
+_SLURM_STATE = {
+    "COMPLETED": "DONE",
+    "RUNNING": "RUNNING",
+    "PENDING": "PENDING",
+    "REQUEUED": "PENDING",
+    "RESIZING": "RUNNING",
+    "SUSPENDED": "RUNNING",
+}
 
 _GENERIC_FAIL = [
     r"Traceback \(most recent call last\)",
@@ -155,6 +177,95 @@ def _newest_mtime(workdir, patterns):
             except OSError:
                 pass
     return newest
+
+
+def _sacct_lookup(job_id, method):
+    """Query SLURM accounting by job name. Returns dict with keys
+    state/start/end/elapsed, or None if sacct has no record / is unavailable.
+    Uses -X (parent rows only) and -P (pipe-delimited). Takes the most recent
+    matching row (a job_id could in principle be re-run)."""
+    if not USE_SACCT:
+        return None
+    name = f"{SACCT_NAME_PREFIX[method]}-{job_id}"
+    try:
+        out = subprocess.run(
+            [SACCT_BIN, "--name", name, "-X", "-P", "--noheader",
+             "--format", "JobID,State,Start,End,Elapsed"],
+            capture_output=True, text=True, timeout=30)
+    except Exception:
+        return None
+    if out.returncode != 0:
+        return None
+    best = None
+    for line in out.stdout.splitlines():
+        parts = line.split("|")
+        if len(parts) < 5:
+            continue
+        jobid, state, start, end, elapsed = parts[:5]
+        # State can be like "CANCELLED by 12345"; keep the first word.
+        state = state.split()[0] if state else ""
+        rec = {"jobid": jobid, "state": state, "start": start,
+               "end": end, "elapsed": elapsed}
+        # Higher numeric JobID = more recent submission.
+        try:
+            key = int(re.split(r"[._]", jobid)[0])
+        except ValueError:
+            key = 0
+        if best is None or key >= best[0]:
+            best = (key, rec)
+    return best[1] if best else None
+
+
+def _sacct_to_dt(s):
+    """SLURM time 'YYYY-MM-DDTHH:MM:SS' -> epoch. 'Unknown'/'' -> None."""
+    if not s or s in ("Unknown", "None"):
+        return None
+    try:
+        return time.mktime(time.strptime(s, "%Y-%m-%dT%H:%M:%S"))
+    except (ValueError, TypeError):
+        return None
+
+
+def resolve_method(workdir, job_id, method):
+    """Authoritative per-method (status, start_epoch, end_epoch, runtime_str).
+
+    Primary source is SLURM accounting (real Start/End/Elapsed/State). Falls
+    back to file-based detection when sacct has no record (old jobs purged from
+    accounting). Truth-guard: even when sacct says COMPLETED, if the method's
+    done-marker is missing the run produced nothing -> FAILED (catches the
+    'exited rc=0 but no prediction output' case)."""
+    sa = _sacct_lookup(job_id, method)
+    if sa is not None:
+        status = _SLURM_STATE.get(sa["state"], "FAILED")
+        start = _sacct_to_dt(sa["start"])
+        end = _sacct_to_dt(sa["end"])
+        runtime = sa["elapsed"] if sa["elapsed"] not in ("", "Unknown") else ""
+        # Truth-guard: SLURM-COMPLETED but no actual output -> FAILED.
+        if status == "DONE" and not _method_produced_output(workdir, method):
+            status = "FAILED"
+        return status, start, end, runtime
+    # Fallback: file-based detection + mtimes (no sacct record).
+    status = method_status(workdir, method)
+    start, end = method_times(workdir, method, status)
+    runtime = _runtime_str(start, end) if (start and end) else ""
+    return status, start, end, runtime
+
+
+def _method_produced_output(workdir, method):
+    pr = METHOD_PROBES[method]
+    if pr.get("done_file") and os.path.exists(
+            os.path.join(workdir, pr["done_file"])):
+        return True
+    if pr.get("done_glob") and _has_output(workdir, pr["done_glob"]):
+        return True
+    return False
+
+
+def _runtime_str(start, end):
+    secs = int(max(0, end - start))
+    h, rem = divmod(secs, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
 
 
 def method_status(workdir, method):
@@ -280,11 +391,15 @@ def scan():
             job = load_job(workdir)
             if job is None:
                 continue
-            statuses = {m: method_status(workdir, m) for m in job["methods"]}
+            resolved = {m: resolve_method(workdir, job["job_id"], m)
+                        for m in job["methods"]}
+            statuses = {m: resolved[m][0] for m in job["methods"]}
+            # last_update: newest of method end-times, log mtimes, submit time.
+            end_epochs = [resolved[m][2] for m in job["methods"] if resolved[m][2]]
             last_update = max(
                 [_newest_mtime(workdir, [METHOD_PROBES[m]["log"]])
-                 for m in job["methods"]] + [job["submitted_at"], 0.0])
-            rec = {**job, "statuses": statuses,
+                 for m in job["methods"]] + end_epochs + [job["submitted_at"], 0.0])
+            rec = {**job, "statuses": statuses, "resolved": resolved,
                    "job_status": overall_status(job["methods"], statuses),
                    "last_update": last_update}
             prev = best.get(job["job_id"])
@@ -304,13 +419,14 @@ def scan():
             "last_update": fmt(rec["last_update"]),
         }
         for m in METHODS:
-            row[m] = rec["statuses"].get(m, "--")  # -- = method not expected
-            if m in rec["statuses"]:
-                s, e = method_times(rec["workdir"], m, rec["statuses"][m])
+            if m in rec["resolved"]:
+                status, s, e, runtime = rec["resolved"][m]
             else:
-                s, e = None, None
+                status, s, e, runtime = "--", None, None, ""
+            row[m] = status
             row[f"{m}_start"] = fmt(s) if s else ""
             row[f"{m}_end"] = fmt(e) if e else ""
+            row[f"{m}_runtime"] = runtime
         rows.append(row)
         if rec["job_status"] in ("COMPLETE", "FAILED"):
             terminal.append(rec)
@@ -319,7 +435,7 @@ def scan():
 
 CSV_FIELDS = ["job_id", "mrn", "patient_name", "submitter", "submitted_at"]
 for _m in METHODS:
-    CSV_FIELDS += [_m, f"{_m}_start", f"{_m}_end"]
+    CSV_FIELDS += [_m, f"{_m}_start", f"{_m}_end", f"{_m}_runtime"]
 CSV_FIELDS += ["job_status", "last_update"]
 
 
