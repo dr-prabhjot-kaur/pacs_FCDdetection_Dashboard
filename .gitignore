@@ -1,0 +1,17 @@
+# conda env — never commit
+dashenv/
+
+# python cache
+__pycache__/
+*.pyc
+
+# runtime state / data — lives on the fileserver, not in git
+state/
+*.notified
+.upload_hash
+fcd_dashboard.csv
+fcd_dashboard.xlsx
+cron.log
+
+# local mount stub
+OneDrive/
