@@ -16,14 +16,20 @@ os.environ["FCD_STATUS_ROOT"] = os.path.join(SBOX, "status")
 os.environ["FCD_DASHBOARD_CSV"] = os.path.join(SBOX, "fcd_dashboard.csv")
 os.environ["FCD_SMTP_HOST"] = "stub"  # never contacted; SMTP is monkeypatched
 
+os.environ["FCD_SMTP_HOST"] = "bad.relay.invalid,good.relay.invalid"  # 1st fails, 2nd works
+
 import dashboard_status as ds          # noqa: E402  (env must be set first)
 
 # ---- capture emails instead of sending --------------------------------
 SENT = []
+RELAY_ATTEMPTS = []
 
 
 class FakeSMTP:
-    def __init__(self, *a, **k): pass
+    def __init__(self, host, *a, **k):
+        RELAY_ATTEMPTS.append(host)
+        if host == "bad.relay.invalid":
+            raise ConnectionRefusedError("simulated relay down")
     def __enter__(self): return self
     def __exit__(self, *a): return False
     def send_message(self, msg): SENT.append(msg["Subject"])
@@ -86,6 +92,10 @@ check(len(first) == 2, f"2 emails on first run (got {len(first)})")
 check(any("FAILED" in s for s in first), "FAILED email sent")
 check(any("COMPLETE" in s for s in first), "COMPLETE email sent")
 check(len(second) == len(first), "no duplicate emails on rerun")
+
+print("relay failover:")
+check("bad.relay.invalid" in RELAY_ATTEMPTS, "tried first relay (failed)")
+check("good.relay.invalid" in RELAY_ATTEMPTS, "fell over to second relay")
 
 print(f"\nsandbox: {SBOX}")
 print("RESULT:", "ALL PASS" if ok else "FAILURES ABOVE")
