@@ -25,7 +25,14 @@ OUTPUT_CSV = os.environ.get(
     "FCD_DASHBOARD_CSV",
     "/fileserver/Rad-Warfield-e2/CHANGE_ME/OneDrive/fcd_dashboard.csv",
 )
-SMTP_HOST = os.environ.get("FCD_SMTP_HOST", "CHANGE_ME.childrens.harvard.edu")
+# Comma-separated relays, tried in order until one accepts the message.
+SMTP_HOSTS = os.environ.get(
+    "FCD_SMTP_HOST",
+    "mailsmtp1.childrenshospital.org,mailsmtp2.childrenshospital.org,"
+    "mailsmtp3.childrenshospital.org,mailsmtp4.childrenshospital.org,"
+    "mailsmtp5.childrenshospital.org,mailsmtp6.childrenshospital.org,"
+    "mailsmtp7.childrenshospital.org",
+).split(",")
 SMTP_PORT = int(os.environ.get("FCD_SMTP_PORT", "25"))   # internal relay, no auth
 MAIL_FROM = os.environ.get("FCD_MAIL_FROM", "fcd-pipeline@childrens.harvard.edu")
 MAIL_TO = os.environ.get(
@@ -134,12 +141,21 @@ def notify(job_id, meta, statuses, job_status):
     msg["From"] = MAIL_FROM
     msg["To"] = ", ".join(MAIL_TO)
     msg.set_content(body)
-    try:
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as s:
-            s.send_message(msg)
-    except Exception as e:
-        os.unlink(sentinel)  # roll back so the next cron run retries
-        print(f"[warn] email failed for {job_id}: {e}", file=sys.stderr)
+    sent = False
+    for host in SMTP_HOSTS:
+        host = host.strip()
+        if not host:
+            continue
+        try:
+            with smtplib.SMTP(host, SMTP_PORT, timeout=30) as s:
+                s.send_message(msg)
+            sent = True
+            break
+        except Exception as e:
+            print(f"[warn] relay {host} failed for {job_id}: {e}",
+                  file=sys.stderr)
+    if not sent:
+        os.unlink(sentinel)  # all relays down -> next cron run retries
 
 
 def main():
