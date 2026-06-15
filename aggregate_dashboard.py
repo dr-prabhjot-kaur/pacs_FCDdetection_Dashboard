@@ -289,11 +289,40 @@ def write_csv(rows):
         os.makedirs(d, exist_ok=True)
     tmp = OUTPUT_CSV + ".tmp"
     with open(tmp, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=CSV_FIELDS)
+        w = csv.DictWriter(f, fieldnames=CSV_FIELDS, extrasaction="ignore")
         w.writeheader()
         for r in rows:
             w.writerow(r)
     os.replace(tmp, OUTPUT_CSV)
+
+
+def _parse_dt(s):
+    try:
+        return time.mktime(time.strptime(s, "%Y-%m-%d %H:%M:%S"))
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def merge_with_ledger(current_rows):
+    """Accumulate: keep every job ever seen. Existing CSV rows are the ledger;
+    jobs still on disk overwrite their row with fresh status, jobs whose dirs
+    are gone stay frozen at their last recorded state. Keyed by job_id."""
+    ledger = {}
+    if os.path.exists(OUTPUT_CSV):
+        try:
+            with open(OUTPUT_CSV, newline="") as f:
+                for r in csv.DictReader(f):
+                    jid = r.get("job_id")
+                    if jid:
+                        ledger[jid] = r
+        except Exception as e:
+            print(f"[warn] could not read existing CSV ({e}); "
+                  f"starting fresh ledger", file=sys.stderr)
+    for r in current_rows:           # disk is truth for jobs that still exist
+        ledger[r["job_id"]] = r
+    return sorted(ledger.values(),
+                  key=lambda r: _parse_dt(r.get("last_update", "")),
+                  reverse=True)
 
 
 def notify(rec):
@@ -343,10 +372,11 @@ def notify(rec):
 
 def main():
     rows, terminal = scan()
-    write_csv(rows)
+    merged = merge_with_ledger(rows)
+    write_csv(merged)
     for rec in terminal:
         notify(rec)
-    print(f"{fmt(time.time())}  jobs={len(rows)}  "
+    print(f"{fmt(time.time())}  on_disk={len(rows)}  total_in_ledger={len(merged)}  "
           f"terminal={len(terminal)}  csv={OUTPUT_CSV}")
 
 
